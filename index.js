@@ -12,6 +12,7 @@ const {
   BatchWriteItemCommand,
   UpdateItemCommand,
   DeleteItemCommand,
+  PutItemCommand, // ADDED for row creation
 } = require("@aws-sdk/client-dynamodb");
 const { marshall, unmarshall } = require("@aws-sdk/util-dynamodb");
 
@@ -423,7 +424,6 @@ app.post("/parse", upload.single("file"), async (req, res) => {
         sheetName: "dataset",
         category,
         parsedRecords: cleanedRecords,
-        headerOriginalOrder,
       });
       parseType = "csv";
     }
@@ -775,6 +775,20 @@ function norm(str) {
     .toLowerCase();
 }
 
+// NEW: quick ID existence check for frontend validation
+app.get("/item/exists/:id", async (req, res) => {
+  try {
+    const dynamo = createDynamoClient();
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ error: "Missing id in path" });
+    const item = await getItemById(dynamo, id);
+    return res.json({ exists: !!item });
+  } catch (err) {
+    console.error("GET /item/exists/:id error", err);
+    return res.status(500).json({ error: "Failed to check ID existence", details: String(err) });
+  }
+});
+
 // PATCH item attribute — enforce column exists in category schema
 app.patch("/item/:id", async (req, res) => {
   try {
@@ -786,7 +800,6 @@ app.patch("/item/:id", async (req, res) => {
     if (!attribute)
       return res.status(400).json({ error: "Missing attribute in body" });
 
-    // 1) Load item
     const item = await getItemById(dynamo, id);
     if (!item) return res.status(404).json({ error: "Item not found" });
 
@@ -797,7 +810,6 @@ app.patch("/item/:id", async (req, res) => {
         .json({ error: "Item category unknown; cannot validate attribute" });
     }
 
-    // 2) Load schema for category
     const schemaItem = await getSchemaForCategory(dynamo, effectiveCategory);
     if (!schemaItem) {
       return res
@@ -815,7 +827,6 @@ app.patch("/item/:id", async (req, res) => {
 
     const attrNorm = norm(attribute);
 
-    // 3) Validate attribute exists in schema
     if (!headerNorm.includes(attrNorm)) {
       return res.status(400).json({
         error: "Attribute not allowed for this category",
@@ -824,17 +835,10 @@ app.patch("/item/:id", async (req, res) => {
       });
     }
 
-    // 4) Update with category condition
     const Key = marshall({ [DYNAMO_PK]: id });
     const ExpressionAttributeNames = { "#attr": attribute, "#cat": "category" };
-    const marshalledVals = marshall({
-      ":val": value,
-      ":cat": effectiveCategory,
-    });
-    const ExpressionAttributeValues = {
-      ":val": marshalledVals[":val"],
-      ":cat": marshalledVals[":cat"],
-    };
+    const marshalledVals = marshall({ ":val": value, ":cat": effectiveCategory });
+    const ExpressionAttributeValues = { ":val": marshalledVals[":val"], ":cat": marshalledVals[":cat"] };
 
     const params = {
       TableName: DYNAMO_TABLE,
@@ -915,11 +919,7 @@ app.delete("/category/:name/column/:columnName", async (req, res) => {
     const rawColumnName = req.params.columnName;
     if (!category || !rawColumnName)
       return res.status(400).json({ error: "Missing category or column name" });
-    if (
-      ["nom", "nombre", "pierres", "piedras"].includes(
-        String(rawColumnName).trim().toLowerCase()
-      )
-    )
+    if (["nom", "nombre", "pierres", "piedras"].includes(String(rawColumnName).trim().toLowerCase()))
       return res.status(403).json({ error: "Protected column" });
 
     const rows = await scanAll(dynamo, {
@@ -932,11 +932,7 @@ app.delete("/category/:name/column/:columnName", async (req, res) => {
     let removedCount = 0;
     for (const r of rows) {
       const pkVal = r[DYNAMO_PK];
-      if (
-        typeof pkVal === "string" &&
-        pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)
-      )
-        continue;
+      if (typeof pkVal === "string" && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
       try {
         const Key = marshall({ [DYNAMO_PK]: pkVal });
         const params = {
@@ -950,56 +946,36 @@ app.delete("/category/:name/column/:columnName", async (req, res) => {
         await dynamo.send(cmd);
         removedCount++;
       } catch (err) {
-        console.error(
-          "Failed to remove attribute for item:",
-          pkVal,
-          rawColumnName,
-          err
-        );
+        console.error("Failed to remove attribute for item:", pkVal, rawColumnName, err);
       }
     }
 
-    // update schema
     const all = await scanAll(dynamo, {});
     const schemaPk = `${DYNAMO_SCHEMA_PREFIX}#${category}`;
     const schemaItem = all.find((s) => s[DYNAMO_PK] === schemaPk);
     let updatedSchema = false;
     if (schemaItem) {
-      const hdrOrig = Array.isArray(schemaItem.headerOriginalOrder)
-        ? schemaItem.headerOriginalOrder
-        : [];
-      const hdrNorm = Array.isArray(schemaItem.headerNormalizedOrder)
-        ? schemaItem.headerNormalizedOrder
-        : [];
+      const hdrOrig = Array.isArray(schemaItem.headerOriginalOrder) ? schemaItem.headerOriginalOrder : [];
+      const hdrNorm = Array.isArray(schemaItem.headerNormalizedOrder) ? schemaItem.headerNormalizedOrder : [];
       const filteredOrig = [];
       const filteredNorm = [];
       for (let i = 0; i < hdrOrig.length; i++) {
         const o = hdrOrig[i];
         const n = hdrNorm[i] || (typeof o === "string" ? o.toLowerCase() : "");
         if (String(o).trim() === String(rawColumnName).trim()) {
-        } else if (
-          String(n).trim() === String(rawColumnName).trim().toLowerCase()
-        ) {
+        } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) {
         } else {
           filteredOrig.push(o);
           filteredNorm.push(n);
         }
       }
-      if (
-        filteredOrig.length !== hdrOrig.length ||
-        filteredNorm.length !== hdrNorm.length
-      ) {
+      if (filteredOrig.length !== hdrOrig.length || filteredNorm.length !== hdrNorm.length) {
         const Key = marshall({ [DYNAMO_PK]: schemaPk });
-        const exprVals = marshall({
-          ":h": filteredOrig,
-          ":n": filteredNorm,
-          ":u": new Date().toISOString(),
-        });
+        const exprVals = marshall({ ":h": filteredOrig, ":n": filteredNorm, ":u": new Date().toISOString() });
         const params = {
           TableName: DYNAMO_TABLE,
           Key,
-          UpdateExpression:
-            "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
+          UpdateExpression: "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
           ExpressionAttributeValues: exprVals,
           ReturnValues: "ALL_NEW",
         };
@@ -1013,11 +989,7 @@ app.delete("/category/:name/column/:columnName", async (req, res) => {
       }
     }
 
-    return res.json({
-      message: "Column deletion completed",
-      removedCount,
-      updatedSchema,
-    });
+    return res.json({ message: "Column deletion completed", removedCount, updatedSchema });
   } catch (err) {
     console.error("DELETE /category/:name/column/:columnName error", err);
     return res
@@ -1032,17 +1004,10 @@ app.delete("/category/:name/column", async (req, res) => {
   const dynamo = createDynamoClient();
   try {
     const category = req.params.name;
-    const rawColumnName =
-      (req.body && (req.body.column || req.body.columnName)) || null;
+    const rawColumnName = (req.body && (req.body.column || req.body.columnName)) || null;
     if (!category || !rawColumnName)
-      return res
-        .status(400)
-        .json({ error: "Missing category or column name in body" });
-    if (
-      ["nom", "nombre", "pierres", "piedras"].includes(
-        String(rawColumnName).trim().toLowerCase()
-      )
-    )
+      return res.status(400).json({ error: "Missing category or column name in body" });
+    if (["nom", "nombre", "pierres", "piedras"].includes(String(rawColumnName).trim().toLowerCase()))
       return res.status(403).json({ error: "Protected column" });
 
     const rows = await scanAll(dynamo, {
@@ -1055,11 +1020,7 @@ app.delete("/category/:name/column", async (req, res) => {
     let removedCount = 0;
     for (const r of rows) {
       const pkVal = r[DYNAMO_PK];
-      if (
-        typeof pkVal === "string" &&
-        pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)
-      )
-        continue;
+      if (typeof pkVal === "string" && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
       try {
         const Key = marshall({ [DYNAMO_PK]: pkVal });
         const params = {
@@ -1073,56 +1034,36 @@ app.delete("/category/:name/column", async (req, res) => {
         await dynamo.send(cmd);
         removedCount++;
       } catch (err) {
-        console.error(
-          "Failed to remove attribute for item:",
-          pkVal,
-          rawColumnName,
-          err
-        );
+        console.error("Failed to remove attribute for item:", pkVal, rawColumnName, err);
       }
     }
 
-    // update schema (same logic as above)
     const all = await scanAll(dynamo, {});
     const schemaPk = `${DYNAMO_SCHEMA_PREFIX}#${category}`;
     const schemaItem = all.find((s) => s[DYNAMO_PK] === schemaPk);
     let updatedSchema = false;
     if (schemaItem) {
-      const hdrOrig = Array.isArray(schemaItem.headerOriginalOrder)
-        ? schemaItem.headerOriginalOrder
-        : [];
-      const hdrNorm = Array.isArray(schemaItem.headerNormalizedOrder)
-        ? schemaItem.headerNormalizedOrder
-        : [];
+      const hdrOrig = Array.isArray(schemaItem.headerOriginalOrder) ? schemaItem.headerOriginalOrder : [];
+      const hdrNorm = Array.isArray(schemaItem.headerNormalizedOrder) ? schemaItem.headerNormalizedOrder : [];
       const filteredOrig = [];
       const filteredNorm = [];
       for (let i = 0; i < hdrOrig.length; i++) {
         const o = hdrOrig[i];
         const n = hdrNorm[i] || (typeof o === "string" ? o.toLowerCase() : "");
         if (String(o).trim() === String(rawColumnName).trim()) {
-        } else if (
-          String(n).trim() === String(rawColumnName).trim().toLowerCase()
-        ) {
+        } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) {
         } else {
           filteredOrig.push(o);
           filteredNorm.push(n);
         }
       }
-      if (
-        filteredOrig.length !== hdrOrig.length ||
-        filteredNorm.length !== hdrNorm.length
-      ) {
+      if (filteredOrig.length !== hdrOrig.length || filteredNorm.length !== hdrNorm.length) {
         const Key = marshall({ [DYNAMO_PK]: schemaPk });
-        const exprVals = marshall({
-          ":h": filteredOrig,
-          ":n": filteredNorm,
-          ":u": new Date().toISOString(),
-        });
+        const exprVals = marshall({ ":h": filteredOrig, ":n": filteredNorm, ":u": new Date().toISOString() });
         const params = {
           TableName: DYNAMO_TABLE,
           Key,
-          UpdateExpression:
-            "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
+          UpdateExpression: "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
           ExpressionAttributeValues: exprVals,
           ReturnValues: "ALL_NEW",
         };
@@ -1136,11 +1077,7 @@ app.delete("/category/:name/column", async (req, res) => {
       }
     }
 
-    return res.json({
-      message: "Column deletion completed",
-      removedCount,
-      updatedSchema,
-    });
+    return res.json({ message: "Column deletion completed", removedCount, updatedSchema });
   } catch (err) {
     console.error("DELETE /category/:name/column (body) error", err);
     return res
@@ -1155,9 +1092,7 @@ app.get("/export/category/:name", async (req, res) => {
     const category = req.params.name;
     const dynamo = createDynamoClient();
     const all = await scanAll(dynamo, {});
-    const schemaItem = all.find(
-      (s) => s[DYNAMO_PK] === `${DYNAMO_SCHEMA_PREFIX}#${category}`
-    );
+    const schemaItem = all.find((s) => s[DYNAMO_PK] === `${DYNAMO_SCHEMA_PREFIX}#${category}`);
 
     const items = [];
     let ExclusiveStartKey = undefined;
@@ -1181,14 +1116,8 @@ app.get("/export/category/:name", async (req, res) => {
     } while (ExclusiveStartKey);
 
     const workbook = XLSX.utils.book_new();
-    const headerOrig =
-      schemaItem && schemaItem.headerOriginalOrder
-        ? schemaItem.headerOriginalOrder
-        : [];
-    const headerNorm =
-      schemaItem && schemaItem.headerNormalizedOrder
-        ? schemaItem.headerNormalizedOrder
-        : headerOrig.map((h) => String(h).toLowerCase());
+    const headerOrig = schemaItem && schemaItem.headerOriginalOrder ? schemaItem.headerOriginalOrder : [];
+    const headerNorm = schemaItem && schemaItem.headerNormalizedOrder ? schemaItem.headerNormalizedOrder : headerOrig.map((h) => String(h).toLowerCase());
     const columns = [DYNAMO_PK, ...headerOrig];
 
     const rows = items.map((it) => {
@@ -1203,29 +1132,16 @@ app.get("/export/category/:name", async (req, res) => {
     });
 
     const ws = XLSX.utils.json_to_sheet(rows, { header: columns });
-    XLSX.utils.book_append_sheet(
-      workbook,
-      ws,
-      (category || "category").substring(0, 31)
-    );
+    XLSX.utils.book_append_sheet(workbook, ws, (category || "category").substring(0, 31));
     const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${category}.xlsx"`
-    );
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${category}.xlsx"`);
     res.send(wbout);
   } catch (err) {
     console.error("/export/category error", err);
     res
       .status(500)
-      .json({
-        error: "Failed to export category as XLSX",
-        details: String(err),
-      });
+      .json({ error: "Failed to export category as XLSX", details: String(err) });
   }
 });
 
@@ -1235,14 +1151,10 @@ app.get("/export/all", async (req, res) => {
     const all = await scanAll(dynamo, {});
     const schemaItems = all.filter((it) => {
       const pk = it[DYNAMO_PK];
-      return (
-        typeof pk === "string" && pk.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)
-      );
+      return (typeof pk === "string" && pk.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`));
     });
     if (!schemaItems.length)
-      return res
-        .status(400)
-        .json({ error: "No categories/schema found to export" });
+      return res.status(400).json({ error: "No categories/schema found to export" });
     const workbook = XLSX.utils.book_new();
 
     for (const sch of schemaItems) {
@@ -1262,21 +1174,14 @@ app.get("/export/all", async (req, res) => {
         const raw = resp.Items || [];
         for (const it of raw) {
           const obj = unmarshall(it);
-          if (obj[DYNAMO_PK] === `${DYNAMO_SCHEMA_PREFIX}#${category}`)
-            continue;
+          if (obj[DYNAMO_PK] === `${DYNAMO_SCHEMA_PREFIX}#${category}`) continue;
           items.push(obj);
         }
         ExclusiveStartKey = resp.LastEvaluatedKey;
       } while (ExclusiveStartKey);
 
-      const headerOrig =
-        sch.headerOriginalOrder && sch.headerOriginalOrder.length
-          ? sch.headerOriginalOrder
-          : [];
-      const headerNorm =
-        sch.headerNormalizedOrder && sch.headerNormalizedOrder.length
-          ? sch.headerNormalizedOrder
-          : headerOrig.map((h) => String(h).toLowerCase());
+      const headerOrig = sch.headerOriginalOrder && sch.headerOriginalOrder.length ? sch.headerOriginalOrder : [];
+      const headerNorm = sch.headerNormalizedOrder && sch.headerNormalizedOrder.length ? sch.headerNormalizedOrder : headerOrig.map((h) => String(h).toLowerCase());
       const columns = [DYNAMO_PK, ...headerOrig];
 
       const rows = items.map((it) => {
@@ -1291,22 +1196,12 @@ app.get("/export/all", async (req, res) => {
       });
 
       const ws = XLSX.utils.json_to_sheet(rows, { header: columns });
-      XLSX.utils.book_append_sheet(
-        workbook,
-        ws,
-        (category || "category").substring(0, 31)
-      );
+      XLSX.utils.book_append_sheet(workbook, ws, (category || "category").substring(0, 31));
     }
 
     const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="all_categories.xlsx"`
-    );
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="all_categories.xlsx"`);
     res.send(wbout);
   } catch (err) {
     console.error("Export all error", err);
@@ -1316,87 +1211,47 @@ app.get("/export/all", async (req, res) => {
   }
 });
 
-// Insert column at a specific index in schema arrays and initialize values in items
-// Body: { columnName: string, insertIndex: number, defaultValue?: any }
+// Insert column (existing)
 app.post("/category/:name/column", async (req, res) => {
   const dynamo = createDynamoClient();
   try {
     const category = req.params.name;
     const { columnName, insertIndex, defaultValue = null } = req.body || {};
-    if (!category)
-      return res.status(400).json({ error: "Missing category param" });
-    if (!columnName || String(columnName).trim() === "")
-      return res.status(400).json({ error: "Missing columnName in body" });
+    if (!category) return res.status(400).json({ error: "Missing category param" });
+    if (!columnName || String(columnName).trim() === "") return res.status(400).json({ error: "Missing columnName in body" });
 
-    // Disallow protected names and reserved attributes
-    const protectedSet = new Set([
-      "nom",
-      "nombre",
-      "pierres",
-      "piedras",
-      "total",
-      "id",
-      String(DYNAMO_PK).toLowerCase(),
-      "category",
-    ]);
+    const protectedSet = new Set(["nom","nombre","pierres","piedras","total","id",String(DYNAMO_PK).toLowerCase(),"category"]);
     const colNorm = norm(columnName);
-    if (protectedSet.has(colNorm))
-      return res
-        .status(403)
-        .json({ error: `Protected or reserved column "${columnName}"` });
+    if (protectedSet.has(colNorm)) return res.status(403).json({ error: `Protected or reserved column "${columnName}"` });
 
-    // Load schema
     const all = await scanAll(dynamo, {});
     const schemaPk = `${DYNAMO_SCHEMA_PREFIX}#${category}`;
     const schemaItem = all.find((s) => s[DYNAMO_PK] === schemaPk);
-    if (!schemaItem)
-      return res
-        .status(404)
-        .json({ error: `Schema not found for category "${category}"` });
+    if (!schemaItem) return res.status(404).json({ error: `Schema not found for category "${category}"` });
 
-    const headerOrig = Array.isArray(schemaItem.headerOriginalOrder)
-      ? schemaItem.headerOriginalOrder.slice()
-      : [];
-    const headerNorm = Array.isArray(schemaItem.headerNormalizedOrder)
-      ? schemaItem.headerNormalizedOrder.slice()
-      : headerOrig.map((h) => norm(h));
+    const headerOrig = Array.isArray(schemaItem.headerOriginalOrder) ? schemaItem.headerOriginalOrder.slice() : [];
+    const headerNorm = Array.isArray(schemaItem.headerNormalizedOrder) ? schemaItem.headerNormalizedOrder.slice() : headerOrig.map((h) => norm(h));
 
-    // If column already exists, abort
-    if (headerNorm.includes(colNorm))
-      return res
-        .status(409)
-        .json({ error: `Column "${columnName}" already exists in schema` });
+    if (headerNorm.includes(colNorm)) return res.status(409).json({ error: `Column "${columnName}" already exists in schema` });
 
-    // Clamp insert index
-    const idx = Math.max(
-      0,
-      Math.min(Number(insertIndex ?? headerOrig.length), headerOrig.length)
-    );
+    const idx = Math.max(0, Math.min(Number(insertIndex ?? headerOrig.length), headerOrig.length));
     headerOrig.splice(idx, 0, String(columnName));
     headerNorm.splice(idx, 0, colNorm);
 
-    // Update schema item
     const schemaKey = marshall({ [DYNAMO_PK]: schemaPk });
-    const exprVals = marshall({
-      ":h": headerOrig,
-      ":n": headerNorm,
-      ":u": new Date().toISOString(),
-    });
+    const exprVals = marshall({ ":h": headerOrig, ":n": headerNorm, ":u": new Date().toISOString() });
     const schemaParams = {
       TableName: DYNAMO_TABLE,
       Key: schemaKey,
-      UpdateExpression:
-        "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
+      UpdateExpression: "SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u",
       ExpressionAttributeValues: exprVals,
       ReturnValues: "ALL_NEW",
     };
     await dynamo.send(new UpdateItemCommand(schemaParams));
 
-    // Initialize attribute on all items of this category
     const items = [];
     let ExclusiveStartKey = undefined;
     do {
-      // NOTE: removed "#attr" from ExpressionAttributeNames to avoid ValidationException
       const scanParams = {
         TableName: DYNAMO_TABLE,
         FilterExpression: "#c = :cat",
@@ -1410,11 +1265,7 @@ app.post("/category/:name/column", async (req, res) => {
       for (const it of raw) {
         const obj = unmarshall(it);
         const pkVal = obj[DYNAMO_PK];
-        if (
-          typeof pkVal === "string" &&
-          pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)
-        )
-          continue; // skip schema
+        if (typeof pkVal === "string" && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
 
         try {
           const Key = marshall({ [DYNAMO_PK]: pkVal });
@@ -1439,22 +1290,15 @@ app.post("/category/:name/column", async (req, res) => {
       column: columnName,
       insertIndex: idx,
       initializedCount: items.length,
-      schema: {
-        headerOriginalOrder: headerOrig,
-        headerNormalizedOrder: headerNorm,
-      },
+      schema: { headerOriginalOrder: headerOrig, headerNormalizedOrder: headerNorm },
     });
   } catch (err) {
     console.error("POST /category/:name/column error", err);
-    return res
-      .status(500)
-      .json({ error: "Failed to insert column", details: String(err) });
+    return res.status(500).json({ error: "Failed to insert column", details: String(err) });
   }
 });
 
-// Create a new item (row) in category
-// Body: { category: string, values: Record<string, any>, id?: string }
-// Returns created item. The viewer controls visual insertion position client-side.
+// Create item (existing route, unchanged logic; PutItemCommand is now imported)
 app.post("/item", async (req, res) => {
   try {
     const dynamo = createDynamoClient();
@@ -1462,7 +1306,6 @@ app.post("/item", async (req, res) => {
     if (!category)
       return res.status(400).json({ error: "Missing category in body" });
 
-    // Load schema to validate/normalize keys
     const all = await scanAll(dynamo, {});
     const schemaPk = `${DYNAMO_SCHEMA_PREFIX}#${category}`;
     const schemaItem = all.find((s) => s[DYNAMO_PK] === schemaPk);
@@ -1477,13 +1320,11 @@ app.post("/item", async (req, res) => {
     const newId = id && String(id).trim() ? String(id).trim() : uuidv4();
 
     const item = { [DYNAMO_PK]: newId, category };
-    // Populate allowed attributes; non-schema keys ignored
     for (const k of Object.keys(values || {})) {
       const nk = norm(k);
       if (nk === norm(DYNAMO_PK) || nk === "category") continue;
       if (headerNorm.includes(nk)) item[nk] = values[k];
     }
-    // Ensure all schema keys exist (null if not provided)
     for (const nk of headerNorm) {
       if (nk === norm(DYNAMO_PK) || nk === "category") continue;
       if (item[nk] === undefined) item[nk] = null;
@@ -1501,6 +1342,53 @@ app.post("/item", async (req, res) => {
     return res
       .status(500)
       .json({ error: "Failed to create item", details: String(err) });
+  }
+});
+
+// NEW: category-scoped row creation with uniqueness check; used by Insert Row modal
+app.post("/category/:name/row", async (req, res) => {
+  try {
+    const dynamo = createDynamoClient();
+    const category = req.params.name;
+    if (!category) return res.status(400).json({ error: "Missing category param" });
+
+    const { insertIndex, id, values = {} } = req.body || {};
+    const newId = id && String(id).trim() ? String(id).trim() : uuidv4();
+
+    const existing = await getItemById(dynamo, newId);
+    if (existing) {
+      return res.status(409).json({ error: "ID already exists", id: newId, code: "ID_CONFLICT" });
+    }
+
+    const schemaItem = await getSchemaForCategory(dynamo, category);
+    if (!schemaItem) {
+      return res.status(404).json({ error: `Schema not found for category "${category}"` });
+    }
+
+    const headerNorm = Array.isArray(schemaItem.headerNormalizedOrder)
+      ? schemaItem.headerNormalizedOrder.map(norm)
+      : [];
+
+    const item = { [DYNAMO_PK]: newId, category };
+    for (const k of Object.keys(values || {})) {
+      const nk = norm(k);
+      if (nk === norm(DYNAMO_PK) || nk === "category") continue;
+      if (headerNorm.includes(nk)) item[nk] = values[k];
+    }
+    for (const nk of headerNorm) {
+      if (nk === norm(DYNAMO_PK) || nk === "category") continue;
+      if (item[nk] === undefined) item[nk] = null;
+    }
+
+    await dynamo.send(new PutItemCommand({
+      TableName: DYNAMO_TABLE,
+      Item: marshall(item, { removeUndefinedValues: true }),
+    }));
+
+    return res.json({ message: "Row created", item, insertIndex });
+  } catch (err) {
+    console.error("POST /category/:name/row error", err);
+    return res.status(500).json({ error: "Failed to create row", details: String(err) });
   }
 });
 
