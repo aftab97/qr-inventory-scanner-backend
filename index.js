@@ -40,7 +40,7 @@ app.get('/', async (req, res) => {
 });
 
 function createDynamoClient() {
-  return new DynamoDBClient({ region: AWS_REGION });
+  return new DynamoDBClient({ region: 'us-east-1', credentials: { accessKeyId: process.env.accessKeyId, secretAccessKey: process.env.secretAccessKey } });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
